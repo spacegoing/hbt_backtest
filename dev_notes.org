@@ -1,0 +1,66 @@
+** Data Input Flow
+
+depth: cache -> data -> DataReader
+snap: MarketDepth
+->
+Local()
+Exchange()
+->
+SingleAssetHftBacktest
+
+
+#+begin_src python
+  # HftBacktest
+  cache = Cache()
+
+  ## for depth file
+  local_reader = DataReader(cache)
+  exch_reader = DataReader(cache)
+
+  for item in data:
+    if isinstance(item, str):
+      local_reader.add_file(item)
+      exch_reader.add_file(item)
+
+  ## for snapshot file
+  local_market_depth = MarketDepth(tick_size, lot_size)
+  exch_market_depth = MarketDepth(tick_size, lot_size)
+
+  if snapshot is not None:
+    snapshot = __load_data(snapshot)
+    local_market_depth.apply_snapshot(snapshot)
+    exch_market_depth.apply_snapshot(snapshot)
+
+  local = Local(local_reader, local_to_exch_orders, exch_to_local_orders,
+                local_market_depth, local_state, order_latency, trade_list_size)
+
+  exch = exchange_model(exch_reader, exch_to_local_orders, local_to_exch_orders,
+                        exch_market_depth, exch_state, order_latency, queue_model)
+
+  return SingleAssetHftBacktest(local, exch)
+#+end_src
+
+
+** hbt call flow
+
+
+main script call hbt.elapse()->HftBacktest-> SingleAssetHftBacktest(Local(),
+PartialFillExchange)
+
+In SingleAssetHftBacktest:
+
+elapse() -> goto(timestamp):
+
+#+begin_src python
+    # SingleAssetHftBacktest goto(timestamp: float64, wait_order_response: int64 = WAIT_ORDER_RESPONSE_NONE)
+    next_local_timestamp = self.local.next_timestamp()
+    next_exch_timestamp = self.exch.next_timestamp()
+    # both are Proc.next_timestamp -> local/exch: ._next_data_timestamp() ->
+    # Proc._next_data_timestamp_column(self, column)
+
+    resp_timestamp = self.local.process(WAIT_ORDER_RESPONSE_NONE)
+
+    resp_timestamp = self.exch.process(
+        wait_order_response
+        if not found_order_resp_timestamp else WAIT_ORDER_RESPONSE_NONE)
+#+end_src
