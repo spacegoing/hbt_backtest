@@ -3,3 +3,6 @@ build
 *.egg-info
 __pycache__
 docs/_build
+data_hftbt/hftbt_collect
+data_hftbt/orderbook
+data_hftbt/trades
