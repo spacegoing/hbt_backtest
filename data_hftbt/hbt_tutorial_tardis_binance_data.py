@@ -88,27 +88,25 @@ with tarfile.open(fpath, 'r:gz') as tar:
           break
       data_dict[member.name] = tmplist
 
-#*
+#* Read Tardis File from !wget https://datasets.tardis.dev/v1/binance-futures/incremental_book_L2/2020/02/01/BTCUSDT.csv.gz -O BTCUSDT_book.csv.gz
 from hftbacktest.data.utils import tardis
 
 data = tardis.convert(['BTCUSDT_trades.csv.gz', 'BTCUSDT_book.csv.gz'])
 
-#* Example: Viz Tardis Data
-a = []
+
+import gzip
+rows = []
 with gzip.open('BTCUSDT_book.csv.gz', 'r') as f:
-  # with gzip.open('BTCUSDT_trades.csv.gz', 'r') as f:
-  aa = f.readlines()
-# a.append(line.decode('utf-8'))
-d = []
-# for a in aa:
-#   d.append(a.decode('utf-8').split(','))
-# if 'true' not in line.decode('utf-8'):
-#   print(line)
-#   if i > 10:
-#     break
-# print(line)
-# if i>100:
-#   break
+  while True:
+    line = f.readline()
+    if line is None or line == b'':
+      break
+    cols = line.decode().strip().split(',')
+    rows.append(cols)
+    if len(rows) > 2008:
+      break
+import pandas as pd
+df = pd.DataFrame(rows[2:])
 
 #* Example: Viz hftb Binance Stream Data
 # binancefutures.convert(

@@ -1,92 +1,119 @@
+import struct
 import pandas as pd
 import dask.dataframe as dd
+import dask.array as da
 from dask import delayed
 import time
+from hftbacktest.reader import TRADE_EVENT, DEPTH_EVENT, DEPTH_CLEAR_EVENT, DEPTH_SNAPSHOT_EVENT
 
-# csv_file = './orderbook/csv/BTCUSDT_T_DEPTH_2022-10-31_depth_snap.csv'
-# csv_file_list = [
-#     './orderbook/csv/BTCUSDT_T_DEPTH_2022-11-01_depth_update.csv',
-#     './orderbook/csv/BTCUSDT_T_DEPTH_2022-11-02_depth_update.csv',
-#     './orderbook/csv/BTCUSDT_T_DEPTH_2022-11-03_depth_update.csv'
-# ]
-# 1031 - 1103: 154379534, 136394246, 158424283, 131870002
-
-# for csv_file in csv_file_list:
-#   ddf = dd.read_csv(csv_file)
-#   print(ddf.shape[0].compute())
-
-#*
 
 # Read the CSV files into Dask DataFrames
-time1 = time.time()
-snap_df = dd.read_csv(
-    './orderbook/csv/BTCUSDT_T_DEPTH_2022-10-31_depth_snap.csv')
-depth_df = dd.read_csv(
-    './orderbook/csv/BTCUSDT_T_DEPTH_2022-10-31_depth_update.csv')
+def parse_one_day(date='2022-10-31'):
+  snap_df = dd.read_csv(
+      f'./orderbook/csv/BTCUSDT_T_DEPTH_{date}_depth_snap.csv')
+  depth_df = dd.read_csv(
+      f'./orderbook/csv/BTCUSDT_T_DEPTH_{date}_depth_update.csv')
+  trades_df = dd.read_csv(f'./trades/csv/BTCUSDT-trades-{date}.csv')
 
-DEPTH_EVENT = 1
-DEPTH_CLEAR_EVENT = 3
-SNAPSHOT_EVENT = 4
+  #* Preprocess DataFrames
+  depth_df['event_type'] = DEPTH_EVENT
+  depth_df['exch_time'] = depth_df['timestamp'] * 1000
+  depth_df['local_time'] = depth_df['exch_time'] + 50000
+  depth_df['side'] = depth_df['side'].map(lambda x: 1 if x == 'b' else -1)
+  depth_df = depth_df[[
+      'event_type', 'exch_time', 'local_time', 'side', 'price', 'qty'
+  ]]
 
-# Combine the DataFrames
-time2 = time.time()
-total_df = dd.concat([snap_df, depth_df], interleave_partitions=True)
+  trades_df['event_type'] = TRADE_EVENT
+  trades_df['exch_time'] = trades_df['time'] * 1000
+  trades_df['local_time'] = trades_df['exch_time'] + 50000
+  trades_df['side'] = (-2 * trades_df['is_buyer_maker'] + 1).astype('int8')
+  trades_df = trades_df[[
+      'event_type', 'exch_time', 'local_time', 'side', 'price', 'qty'
+  ]]
 
-# Sort the DataFrame by 'timestamp'
-total_df = total_df.sort_values('timestamp')
+  snap_df['event_type'] = DEPTH_SNAPSHOT_EVENT
+  snap_df['exch_time'] = snap_df['timestamp'] * 1000
+  snap_df['local_time'] = snap_df['exch_time'] + 50000
+  snap_df['side'] = snap_df['side'].map(lambda x: 1 if x == 'b' else -1)
+  snap_df = snap_df[[
+      'event_type', 'exch_time', 'local_time', 'side', 'price', 'qty'
+  ]]
+  grouped = snap_df.groupby('exch_time')
 
-# Find the first row where update_type is 'snap'
-first_snap_index = total_df[total_df['update_type'] ==
-                            'snap'].index.compute().min()
+  # Define a function that takes a group and returns the new rows to be inserted
+  def insert_depth_clear(group):
+    # Filter the group to only include 'b' or 'a' orders and find the worst bid and ask prices
+    bids = group.query('side == 1')
+    worst_bid = bids['price'].min()
+    worst_bid_qty = bids.query('price == @worst_bid')['qty'].iloc[0]
+    asks = group.query('side == -1')
+    worst_ask = asks['price'].max()
+    worst_ask_qty = asks.query('price == @worst_ask')['qty'].iloc[0]
+    # Create the new rows to be inserted
+    new_rows = pd.DataFrame([{
+        'event_type': DEPTH_CLEAR_EVENT,
+        'exch_time': group['exch_time'].min(),
+        'local_time': group['local_time'].min(),
+        'side': 1,
+        'price': worst_bid,
+        'qty': worst_bid_qty
+    }, {
+        'event_type': DEPTH_CLEAR_EVENT,
+        'exch_time': group['exch_time'].min(),
+        'local_time': group['local_time'].min(),
+        'side': -1,
+        'price': worst_ask,
+        'qty': worst_ask_qty
+    }])
+    # Concatenate the new rows with the original group and return the result
+    res = pd.concat([new_rows, group], axis=0)
+    return res
 
-# Remove all rows above the first 'snap' row
-total_df = total_df.loc[first_snap_index:]
+  # Apply the insert_depth_clear function to each group and concatenate the results
+  snap_df = grouped.apply(
+      insert_depth_clear, meta=snap_df.dtypes.to_dict()).reset_index(drop=True)
 
-# Initialize an empty list to store delayed objects
-delayed_rows = []
+  total_df = dd.concat([snap_df, depth_df, trades_df],
+                       axis=0,
+                       ignore_index=True,
+                       interleave_partitions=True)
 
-# Loop through the partitions in total_df
-old_snap_ts = None
-for partition in total_df.to_delayed():
-  partition = partition.compute()
+  #*
+  def gen_key(row):
+    # Snapshot b clear> snapshot a clear> Snapshot b normal > snapshot a normal
+    # >
+    # snapshot a/b set = trade a/b set
 
-  for _, row in partition.iterrows():
-    event_data = {}
-    event_data['exch_timestamp'] = row['timestamp']
-    event_data['local_timestamp'] = row['timestamp'] + 10_000
-    event_data['side'] = 1 if row['side'] == 'b' else -1
-    event_data['price'] = row['price']
-    event_data['qty'] = row['qty']
-
-    if row['update_type'] == 'snap':
-      if old_snap_ts is None:
-        old_snap_ts = row['timestamp']
-        event_data['event'] = SNAPSHOT_EVENT
+    # Sort key= timestamp + 1 b clear > 2 a clear > 3 b snapnormal > 4 a snapnormal > 5 the other
+    try:
+      if row['event_type'] == DEPTH_CLEAR_EVENT:
+        if row['side'] == 1:
+          return struct.pack('ll', int(row['exch_time']), 1)
+        else:
+          return struct.pack('ll', int(row['exch_time']), 2)
+      elif row['event_type'] == DEPTH_SNAPSHOT_EVENT:
+        if row['side'] == 1:
+          return struct.pack('ll', int(row['exch_time']), 3)
+        else:
+          return struct.pack('ll', int(row['exch_time']), 4)
       else:
-        if row['timestamp'] > old_snap_ts:
-          # Insert DEPTH_CLEAR_EVENT rows
-          for side in [-1, 1]:
-            clear_event_data = {
-                'event': DEPTH_CLEAR_EVENT,
-                'exch_timestamp': old_snap_ts,
-                'local_timestamp': old_snap_ts + 10_000,
-                'side': side,
-                'price': event_data['price'],
-                'qty': 0
-            }
-            delayed_rows.append(delayed(pd.DataFrame([clear_event_data])))
+        return struct.pack('ll', int(row['exch_time']), 5)
+    except Exception as e:
+      import pdb
+      pdb.set_trace()
 
-          old_snap_ts = row['timestamp']
-        event_data['event'] = SNAPSHOT_EVENT
-    else:  # row['update_type'] == 'set'
-      event_data['event'] = DEPTH_EVENT
+  total_df['sort_key'] = total_df.apply(gen_key, axis=1, meta=('sort_key', 'O'))
 
-    # Append the current row's event data as a delayed object
-    delayed_rows.append(delayed(pd.DataFrame([event_data])))
+  total_df = total_df.set_index('sort_key')
+  total_df_sorted = total_df.map_partitions(lambda x: x.sort_index())
 
-# Compute and concatenate the list of delayed rows to create result_df as a Dask DataFrame
-result_df = dd.from_delayed(delayed_rows)
-result_df = result_df.compute()
-time3 = time.time()
-result_df.to_csv('result_df.csv', index=False, single_file=True)
-time4 = time.time()
+  total_df_sorted = total_df_sorted[[
+      'event_type', 'exch_time', 'local_time', 'side', 'price', 'qty'
+  ]]
+
+  total_df_sorted.to_csv('total_sorted.csv', index=False)
+
+  print(total_df.head(10))
+
+  #*
